@@ -1,4 +1,4 @@
--- Snatcher Access, version 0.23
+-- Snatcher Access, version 0.24
 -- Screen reader support for Snatcher (USA, Sega CD) in BizHawk (Genesis Plus GX core).
 -- Reads dialogue with speaker names, every command menu, the title/options/backup RAM
 -- screens, and announces targets during shooting scenes with speech and positional sounds.
@@ -22,9 +22,21 @@
 --                    3-5 leaving, 7 destroyed)
 --   0x7897/0x7899    system screen (0/2 backup RAM choice, 9/2 title, 0B options)
 
-local A = {version = '0.23', frame = 0, hooks = {}}
+local A = {version = '0.24', frame = 0, hooks = {}}
 local source = debug.getinfo(1, 'S').source:sub(2)
-local folder = source:match('^(.*[/\\])') or './'
+local folder = source:match('^(.*[/\\])')
+if not folder then
+	-- Some BizHawk versions run the script under the name "main", so the script's own path is
+	-- unknown. BizHawk runs scripts from their own folder, so use the full current folder:
+	-- prism.dll and the sound files need a full path to load.
+	folder = './'
+	pcall(function()
+		luanet.load_assembly('mscorlib')
+		local dir = luanet.import_type('System.IO.Directory').GetCurrentDirectory()
+		if dir and dir ~= '' then folder = dir:gsub('[/\\]$', '') .. '\\' end
+	end)
+	source = folder .. 'snatcher-access.lua'
+end
 local D = 'CD PRG RAM'
 
 local log = io.open(folder .. 'snatcher-speech.log', 'a')
@@ -77,20 +89,30 @@ public static class SnatcherPrism {
 	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern int prism_backend_speak(IntPtr b, byte[] text, [MarshalAs(UnmanagedType.I1)] bool interrupt);
 	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern int prism_backend_stop(IntPtr b);
 	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern IntPtr prism_backend_name(IntPtr b);
+	[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryW(string path);
 	static IntPtr ctx, backend;
 	public static string Start() {
-		ctx = prism_init(IntPtr.Zero);
-		if (ctx == IntPtr.Zero) return null;
-		backend = prism_registry_create_best(ctx);
-		if (backend == IntPtr.Zero) return null;
-		IntPtr n = prism_backend_name(backend);
-		return n == IntPtr.Zero ? "speech" : Marshal.PtrToStringAnsi(n);
+		try {
+			if (LoadLibraryW(D) == IntPtr.Zero)
+				return "!Windows could not load " + D + " (error " + Marshal.GetLastWin32Error() + ": " + new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message + ")";
+			ctx = prism_init(IntPtr.Zero);
+			if (ctx == IntPtr.Zero) return "!prism_init returned nothing";
+			backend = prism_registry_create_best(ctx);
+			if (backend == IntPtr.Zero) return "!no screen reader or voice was found";
+			IntPtr n = prism_backend_name(backend);
+			return n == IntPtr.Zero ? "speech" : Marshal.PtrToStringAnsi(n);
+		} catch (Exception e) {
+			return "!" + e.GetType().Name + ": " + e.Message;
+		}
 	}
 	public static int Speak(string text, bool interrupt) {
 		if (backend == IntPtr.Zero) return -1;
-		return prism_backend_speak(backend, Encoding.UTF8.GetBytes(text + "\0"), interrupt);
+		try { return prism_backend_speak(backend, Encoding.UTF8.GetBytes(text + "\0"), interrupt); }
+		catch (Exception) { return -2; }
 	}
-	public static int Stop() { return backend == IntPtr.Zero ? -1 : prism_backend_stop(backend); }
+	public static int Stop() {
+		try { return backend == IntPtr.Zero ? -1 : prism_backend_stop(backend); } catch (Exception) { return -2; }
+	}
 }]]
 	code = code:gsub('DLLPATH', function() return dll end)
 	local Provider = luanet.import_type('Microsoft.CSharp.CSharpCodeProvider')
@@ -114,8 +136,16 @@ public static class SnatcherPrism {
 	end
 	local t = result.CompiledAssembly:GetType('SnatcherPrism')
 	local mSpeak, mStop = t:GetMethod('Speak'), t:GetMethod('Stop')
-	local name = t:GetMethod('Start'):Invoke(nil, nil)
-	if name == nil then note('Prism: started, but no screen reader or voice was available'); return nil end
+	local okStart, name = pcall(function() return t:GetMethod('Start'):Invoke(nil, nil) end)
+	if not okStart then
+		local why = tostring(name)
+		pcall(function() local b = name:GetBaseException(); why = b:GetType().FullName .. ': ' .. b.Message end)
+		pcall(function() local b = name.InnerException:GetBaseException(); why = b:GetType().FullName .. ': ' .. b.Message end)
+		note('Prism: crashed while starting: ' .. why)
+		return nil
+	end
+	name = name and tostring(name)
+	if not name or name:sub(1, 1) == '!' then note('Prism: could not start: ' .. tostring(name and name:sub(2))); return nil end
 	local args = Array.CreateInstance(ObjectT, 2)
 	return {
 		name = tostring(name),

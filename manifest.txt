@@ -1,5 +1,5 @@
-version 0.23
-file 36314 snatcher-access.lua
+version 0.24
+file 37860 snatcher-access.lua
 file 1363968 prism.dll
 file 5483 README.txt
 file 38852 sounds/civilian0.wav
