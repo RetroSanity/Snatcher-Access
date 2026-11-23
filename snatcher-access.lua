@@ -1,4 +1,4 @@
--- Snatcher Access, version 0.26
+-- Snatcher Access, version 0.27
 -- Screen reader support for Snatcher (USA, Sega CD) in BizHawk (Genesis Plus GX core).
 -- Reads dialogue with speaker names, every command menu, the title/options/backup RAM
 -- screens, and announces targets during shooting scenes with speech and positional sounds.
@@ -22,7 +22,7 @@
 --                    3-5 leaving, 7 destroyed)
 --   0x7897/0x7899    system screen (0/2 backup RAM choice, 9/2 title, 0B options)
 
-local A = {version = '0.26', frame = 0, hooks = {}}
+local A = {version = '0.27', frame = 0, hooks = {}}
 local source = debug.getinfo(1, 'S').source:sub(2)
 local folder = source:match('^(.*[/\\])')
 if not folder then
@@ -433,15 +433,24 @@ local function title_case(s)
 	return s
 end
 
-local function menu_items()
+-- The menu is checked every frame. Its text is only read again when the item list changes
+-- or the menu opens, because every text read makes BizHawk build a table, and thousands of
+-- those a minute make .NET pause to clean up, which stutters the game's sound.
+local menuCache, menuCacheKey = nil, nil
+local function menu_items(fresh)
 	local count = u8(0x9853)
 	if count == 0 or count > 31 then return nil end
+	local offs = {}
+	for i = 0, count - 1 do offs[#offs + 1] = u16(0x9854 + i * 2) end
+	local key = table.concat(offs, ',')
+	if not fresh and key == menuCacheKey and menuCache then return menuCache end
 	local items = {}
-	for i = 0, count - 1 do
-		local t = text_at(u16(0x9854 + i * 2), 60)
+	for i = 1, count do
+		local t = text_at(offs[i], 60)
 		if t == '' then return nil end
 		items[#items + 1] = title_case(t)
 	end
+	menuCache, menuCacheKey = items, key
 	return items
 end
 
@@ -482,7 +491,7 @@ local function menus()
 		prev.menuActive = false
 		return
 	end
-	local items = menu_items()
+	local items = menu_items(not prev.menuActive)
 	if not items then prev.menuActive = true; return end
 	local key = table.concat(items, '|')
 	local cur = u8(0x9710)
@@ -502,10 +511,9 @@ end
 
 -- System screens (backup RAM choice, title, options) ----------------------------------
 local FP = {0x0A, 0x39, 0x00, 0x01, 0x00, 0x00, 0xCD, 0xAC}
+-- Checked every frame, so it reads two plain numbers rather than making a table.
 local function boot_module()
-	local b = memory.read_bytes_as_array(0x28826, 8, D)
-	for i = 1, 8 do if b[i] ~= FP[i] then return false end end
-	return true
+	return memory.read_u32_be(0x28826, D) == 0x0A390001 and memory.read_u32_be(0x2882A, D) == 0x0000CDAC
 end
 local CONTROLS = {
 	[0] = 'A draw blaster, B cancel, C select and shoot', 'A draw blaster, B select and shoot, C cancel',
@@ -666,8 +674,21 @@ local function caption_fingerprint()
 	return h
 end
 local vramOK = pcall(memory.read_u8, 0, 'VRAM')
+-- BizHawk can hash the tile map itself without making a table, so the full fingerprint is
+-- only worked out when the screen has actually changed.
+-- The hash covers the tile graphics and the tile map. Captions never share the screen with
+-- a command menu, so nothing is checked while a menu is up.
+local HASH_LEN = 0xE000 + 28 * 128
+local hashOK = memory.hash_region and pcall(memory.hash_region, 0, HASH_LEN, 'VRAM')
+local lastMapHash = nil
+note('Screen change check: ' .. (hashOK and 'on' or 'unavailable, using the slower check'))
 local function captions()
-	if not vramOK or A.frame % 8 ~= 0 or u8(0x78E9) ~= 0 then return end
+	if not vramOK or A.frame % 8 ~= 0 or u8(0x78E9) ~= 0 or u8(0x788D) == 1 then return end
+	if hashOK then
+		local h = memory.hash_region(0, HASH_LEN, 'VRAM')
+		if h == lastMapHash then return end
+		lastMapHash = h
+	end
 	local ok, fp = pcall(caption_fingerprint)
 	if not ok then return end
 	if fp ~= prev.caption then
@@ -916,7 +937,7 @@ function A.shutdown()
 end
 
 local function reset_state()
-	prev = {}; menuKey = nil; shot = {active = false, cells = {}, born = {}, life = nil}
+	prev = {}; menuKey = nil; menuCacheKey = nil; lastMapHash = nil; shot = {active = false, cells = {}, born = {}, life = nil}
 end
 A.hooks[#A.hooks + 1] = event.onloadstate(reset_state, 'Snatcher access state reset')
 A.hooks[#A.hooks + 1] = event.onexit(function() A.shutdown() end, 'Snatcher access cleanup')
