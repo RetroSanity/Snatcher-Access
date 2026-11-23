@@ -1,0 +1,563 @@
+-- Snatcher Access, version 0.1
+-- Screen reader support for Snatcher (USA, Sega CD) in BizHawk (Genesis Plus GX core).
+-- Reads dialogue with speaker names, every command menu, the title/options/backup RAM
+-- screens, and announces targets during shooting scenes with speech and positional sounds.
+-- Read-only: the script never changes game memory or presses buttons for you.
+--
+-- Memory map (all in the "CD PRG RAM" domain, found by studying the game):
+--   0x1E000          current scene text bank (plain ASCII, FF = end, F2 = new line,
+--                    F6 = new page, EC/EE/F0 = button letter, F8-FE = colour codes)
+--   0x97D0 (word)    offset of the message being shown, from 0x1E000
+--   0x9746 (word)    text printer position (same base)
+--   0x9740           text state; becomes 2 each time a new box of text starts printing
+--   0x9744           speaker index (0 = none)
+--   0x788D           1 while a command menu is on screen
+--   0x9852/0x9853    menu capacity / item count, then word offsets of item names from 0x1E000
+--   0x9710           menu cursor
+--   0x78BA (word)    button layout 0-5 (Options > Controls)
+--   0x78E3           0x28 during shooting scenes
+--   0x892D           life during shooting scenes
+--   0x8400 + n*0x50  shooting object n (n = grid cell 0-8): +1 active, +0x24 state
+--                    (high nibble 1 = enemy/Snatcher, 2 = civilian; low nibble 0-2 appearing,
+--                    3-5 leaving, 7 destroyed)
+--   0x7897/0x7899    system screen (0/2 backup RAM choice, 9/2 title, 0B options)
+
+local A = {version = '0.1', frame = 0, hooks = {}}
+local source = debug.getinfo(1, 'S').source:sub(2)
+local folder = source:match('^(.*[/\\])') or './'
+local D = 'CD PRG RAM'
+
+local log = io.open(folder .. 'snatcher-speech.log', 'a')
+local last_said, last_message = '', ''
+
+-- Speech: BizHawk builds with a speech module (speech.say) talk through the screen reader.
+-- Ordinary BizHawk has no speech module, so fall back to the Windows voice (SAPI).
+local sapi = nil
+if not (speech and speech.say) and luanet then
+	pcall(function()
+		luanet.load_assembly('System.Speech')
+		local Synth = luanet.import_type('System.Speech.Synthesis.SpeechSynthesizer')
+		sapi = Synth()
+		sapi.Rate = 2
+	end)
+end
+local function say(s, interrupt)
+	if not s or s == '' then return end
+	last_said = s
+	console.log(s)
+	if log then log:write(os.date('%H:%M:%S '), s, '\n'); log:flush() end
+	if speech and speech.say then
+		if interrupt == false then speech.say(s, false) else speech.say(s) end
+	elseif sapi then
+		pcall(function()
+			if interrupt ~= false then sapi:SpeakAsyncCancelAll() end
+			sapi:SpeakAsync(s)
+		end)
+	end
+end
+local function stop_speech()
+	if speech and speech.stop then speech.stop()
+	elseif sapi then pcall(function() sapi:SpeakAsyncCancelAll() end) end
+end
+
+-- Memory helpers ----------------------------------------------------------------------
+local function u8(a) return memory.read_u8(a, D) end
+local function u16(a) return memory.read_u16_be(a, D) end
+
+if emu.getsystemid() ~= 'GEN' then
+	console.log('Snatcher Access: this is not a Genesis or Sega CD game. Nothing was loaded.')
+	if speech and speech.say then speech.say('Snatcher access needs the Sega CD version of Snatcher. Nothing was loaded.') end
+	return
+end
+local okDomain = pcall(memory.read_u8, 0, D)
+if not okDomain then
+	say('Snatcher access could not find the Sega CD program memory. Load Snatcher, USA, Sega CD, with the Genesis Plus GX core.')
+	return
+end
+if not (speech and speech.say) and not sapi then
+	console.log('Speech output is unavailable: no BizHawk speech module and no Windows voice.')
+end
+
+-- Sounds --------------------------------------------------------------------------------
+A.beeps = true      -- positional target sounds
+A.voice = true      -- spoken target positions
+-- Sounds live next to the script, or in D:\Games\Pokemon\Snatcher Access\sounds when the
+-- script is run from another folder (such as the Lua folder).
+local function find_sounds()
+	for _, dir in ipairs({folder .. 'sounds\\', folder .. '..\\Snatcher Access\\sounds\\',
+			'D:\\Games\\Pokemon\\Snatcher Access\\sounds\\'}) do
+		local f = io.open(dir .. 'enemy0.wav', 'rb')
+		if f then f:close(); return dir end
+	end
+	return folder .. 'sounds\\'
+end
+local SOUNDS = find_sounds()
+local audioOK, audio = pcall(function()
+	if not luanet then return nil end
+	luanet.load_assembly('System')
+	local SoundPlayer = luanet.import_type('System.Media.SoundPlayer')
+	local t = {}
+	for _, kind in ipairs({'enemy', 'civilian'}) do
+		t[kind] = {}
+		for cell = 0, 8 do
+			local p = SoundPlayer(SOUNDS .. kind .. cell .. '.wav')
+			p:Load(); t[kind][cell] = p
+		end
+	end
+	local hit = SoundPlayer(SOUNDS .. 'hit.wav'); hit:Load(); t.hit = hit
+	return {
+		play = function(kind, cell) local p = t[kind] and t[kind][cell]; if p then p:Play() end end,
+		hit = function() t.hit:Play() end,
+		close = function()
+			for _, kind in ipairs({'enemy', 'civilian'}) do for c = 0, 8 do pcall(function() t[kind][c]:Dispose() end) end end
+			pcall(function() t.hit:Dispose() end)
+		end,
+	}
+end)
+if not audioOK or not audio then
+	console.log('Target sounds unavailable: ' .. tostring(audio))
+	audio = nil
+end
+
+-- Text ---------------------------------------------------------------------------------
+local BANK = 0x1E000
+local BTN = {[0xEC] = {'A', 'A', 'B', 'C', 'C', 'B'},   -- draw blaster
+             [0xEE] = {'B', 'C', 'A', 'A', 'B', 'C'},   -- cancel
+             [0xF0] = {'C', 'B', 'C', 'B', 'A', 'A'}}   -- select / shoot
+local NAMES = {'Metal Gear', 'Gillian', 'Mika', 'Togo', 'Driver', 'Chief', 'Harry', 'Napoleon', 'Jamie',
+	'Employee', 'Man', 'Stella', 'Christy', 'Woman', 'Fukui the second', 'Miss Hayasaka', 'Mr. Togo',
+	'Mr. Nakamura', 'Nakamura', 'Mr. Sasaki', 'Jeremy', 'Chie', 'Kiwi', 'Mr. Kushibuchi', 'Mr. Inamura',
+	'Jordan', 'Konami', 'Vangie', 'Katrina', 'Passerby', 'P.A.', 'Doorman', 'Manager', 'Isabella',
+	'Sparkster', 'Goemon', 'Mr. Ueda', 'Contra', 'Castlevania pair', 'Customer', 'Dracula',
+	'Simon Belmont', 'Freeman', 'Ivan', 'Lisa', 'Parrot', 'Random'}
+
+local function tidy(s)
+	return (s:gsub('%s+', ' '):gsub('^%s+', ''):gsub('%s+$', ''))
+end
+
+-- Reads a message from the text bank. Returns plain text.
+local function text_at(off, maxlen)
+	local a = BANK + off
+	if a < BANK or a >= 0x7FFF0 then return '' end
+	local n = math.min(maxlen or 1200, 0x80000 - a)
+	local bytes = memory.read_bytes_as_array(a, n, D)
+	local cfg = u16(0x78BA)
+	local out = {}
+	for i = 1, #bytes do
+		local b = bytes[i]
+		if b == 0xFF then break
+		elseif b == 0xF2 or b == 0xF6 then out[#out + 1] = ' '
+		elseif BTN[b] then out[#out + 1] = (BTN[b][cfg + 1] or '?')
+		elseif b >= 0x20 and b < 0x7F then out[#out + 1] = string.char(b) end
+	end
+	return tidy(table.concat(out))
+end
+
+local function speaker()
+	local i = u8(0x9744)
+	return NAMES[i] or ''
+end
+
+-- Menu items are stored in capitals; title case reads better with every speech synthesiser.
+local function title_case(s)
+	s = s:lower():gsub("(%a)([%w']*)", function(f, r) return f:upper() .. r end)
+	s = s:gsub("I%.d%.", "I.D."):gsub(" Of ", " of "):gsub(" The ", " the "):gsub(" To ", " to ")
+	s = s:gsub("'S ", "'s "):gsub("'S$", "'s")
+	return s
+end
+
+local function menu_items()
+	local count = u8(0x9853)
+	if count == 0 or count > 31 then return nil end
+	local items = {}
+	for i = 0, count - 1 do
+		local t = text_at(u16(0x9854 + i * 2), 60)
+		if t == '' then return nil end
+		items[#items + 1] = title_case(t)
+	end
+	return items
+end
+
+-- State --------------------------------------------------------------------------------
+local prev = {}
+local msgFrame = -1000
+local menuKey = nil
+
+local function read_message()
+	local t = text_at(u16(0x97D0))
+	local who = speaker()
+	if who ~= '' then t = who .. ': ' .. t end
+	return t
+end
+
+local function dialogue()
+	local st = u8(0x9740)
+	if st == 2 and prev.st ~= 2 then
+		local pos, start = u16(0x9746), u16(0x97D0)
+		-- The first box of a message speaks the whole message; later boxes of the same
+		-- message are already spoken.
+		if pos == start then
+			local t = read_message()
+			if t ~= '' then
+				last_message = t
+				say(t)
+				msgFrame = A.frame
+			end
+		end
+	end
+	prev.st = st
+end
+
+local function menus()
+	local active = u8(0x788D) == 1
+	if not active then
+		if prev.menuActive then menuKey = nil end
+		prev.menuActive = false
+		return
+	end
+	local items = menu_items()
+	if not items then prev.menuActive = true; return end
+	local key = table.concat(items, '|')
+	local cur = u8(0x9710)
+	if cur >= #items then prev.menuActive = true; return end
+	local line = items[cur + 1] .. ', ' .. (cur + 1) .. ' of ' .. #items
+	if key ~= menuKey or not prev.menuActive then
+		-- A menu that opens right after a line of dialogue waits for that line.
+		say(line, (A.frame - msgFrame) > 150)
+		menuKey = key
+	elseif cur ~= prev.cursor then
+		say(line)
+	end
+	prev.cursor = cur
+	prev.menuActive = true
+	A.menu = items
+end
+
+-- System screens (backup RAM choice, title, options) ----------------------------------
+local FP = {0x0A, 0x39, 0x00, 0x01, 0x00, 0x00, 0xCD, 0xAC}
+local function boot_module()
+	local b = memory.read_bytes_as_array(0x28826, 8, D)
+	for i = 1, 8 do if b[i] ~= FP[i] then return false end end
+	return true
+end
+local CONTROLS = {
+	[0] = 'A draw blaster, B cancel, C select and shoot', 'A draw blaster, B select and shoot, C cancel',
+	'A cancel, B draw blaster, C select and shoot', 'A select and shoot, B draw blaster, C cancel',
+	'A select and shoot, B cancel, C draw blaster', 'A cancel, B select and shoot, C draw blaster'}
+local function option_line(c)
+	if c == 0 then return 'Device, ' .. (u8(0x78B9) == 1 and 'joypad and gun' or 'joypad only') .. ', 1 of 5'
+	elseif c == 1 then return 'Controls, ' .. (CONTROLS[u8(0x78BB)] or 'unknown') .. ', 2 of 5'
+	elseif c == 2 then return 'Sound mode, ' .. (u8(0x78A3) == 1 and 'mono' or 'stereo') .. ', 3 of 5'
+	elseif c == 3 then return 'Gun adjust, 4 of 5'
+	elseif c == 4 then return 'Quit, 5 of 5. Press C to leave options and start.' end
+	return nil
+end
+
+local function bcd(b) return math.floor(b / 16) * 10 + b % 16 end
+local function file_line(slot)
+	local a = 0x28644 + slot * 8
+	local saves = u8(a)
+	local label = 'File ' .. (slot + 1) .. ', '
+	if saves == 0xFF then return label .. 'no data' end
+	local h, m = bcd(u8(a + 2)), bcd(u8(a + 3))
+	local t = (h > 0) and (h .. (h == 1 and ' hour ' or ' hours ') .. m .. ' minutes') or (m .. (m == 1 and ' minute' or ' minutes'))
+	return label .. 'played ' .. t .. ', saved ' .. saves .. (saves == 1 and ' time' or ' times')
+end
+
+local function system_screens()
+	local s7, s9 = u8(0x7897), u8(0x7899)
+	local screen = nil
+	if boot_module() then
+		if s7 == 0 and s9 == 2 then screen = 'bram'
+		elseif s7 == 9 then screen = 'title'
+		elseif s7 == 0x0A then screen = 'files'
+		elseif s7 == 0x0B then screen = 'options' end
+	end
+	if screen ~= prev.screen then
+		prev.screenValue = nil
+		if screen == 'title' then say('Snatcher title screen.')
+		elseif screen == 'bram' then say('Which backup memory will you use?')
+		elseif screen == 'files' then say('Investigation files. Choose a file with up and down, then press Start.')
+		elseif screen == 'options' then say('Options.') end
+	end
+	prev.screen = screen
+	local value = nil
+	if screen == 'bram' then
+		value = (u8(0xCDAC) == 1) and 'CD backup RAM cart, 2 of 2' or 'Internal backup RAM, 1 of 2'
+	elseif screen == 'title' then
+		local c = u8(0x7F79)
+		if c == 1 then value = 'Continue, 2 of 2. Press Start.'
+		elseif c == 3 then value = 'New game, 1 of 2. Press Start.'
+		else value = 'New game. Press Start.' end
+	elseif screen == 'files' then
+		local c = u8(0x78B7)
+		if c <= 3 then value = file_line(c) end
+	elseif screen == 'options' then
+		value = option_line(u8(0x28AD9))
+	end
+	if value and value ~= prev.screenValue then
+		say(value, prev.screenValue ~= nil)
+	end
+	prev.screenValue = value
+	A.screenValue = value
+end
+
+-- Videophone keypad ---------------------------------------------------------------------
+-- 0x9719 is 10 and 0x97F1 is 6 while the number pad is up. 0x97F0 is the key cursor (7 + row*12 + col*2),
+-- 0x97F2 the number of digits typed, and the digits are at 0x9759.
+local KEYS = {{'1', '2', '3'}, {'4', '5', '6'}, {'7', '8', '9'}, {'star', '0', 'hash'}}
+local function digit_name(b)
+	if b == 0x2A then return 'star' elseif b == 0x23 then return 'hash' end
+	if b >= 0x30 and b <= 0x39 then return string.char(b) end
+	return nil
+end
+local function typed()
+	local n = u8(0x97F2)
+	if n == 0 or n > 10 then return '', n end
+	local t = {}
+	local b = memory.read_bytes_as_array(0x9759, n, D)
+	for i = 1, n do
+		local d = digit_name(b[i])
+		if not d then return nil, n end   -- the game has not written this digit yet
+		t[#t + 1] = d
+	end
+	return table.concat(t, ' '), n
+end
+local function phone()
+	-- 0x97F1 becomes 6 once the pad has finished drawing its empty digit boxes.
+	local on = u8(0x9719) == 10 and u8(0x97F1) == 6 and u8(0x97F0) >= 7
+	local key = nil
+	if on then
+		local v = u8(0x97F0) - 7
+		local row, col = math.floor(v / 12), math.floor((v % 12) / 2)
+		key = KEYS[row + 1] and KEYS[row + 1][col + 1]
+	end
+	local digits, n = typed()
+	if on and digits == nil then return end   -- try again next frame
+	if on and not prev.phone then
+		say('Dial a number. Arrows choose a key, C types it, B deletes. The call goes through as soon as the number is complete. Key ' .. (key or '?') .. '.', false)
+	elseif on then
+		if n > (prev.phoneCount or 0) then say(digits)
+		elseif n < (prev.phoneCount or 0) then say(n == 0 and 'Deleted. No digits.' or ('Deleted. ' .. digits))
+		elseif key ~= prev.phoneKey then say(key or '?') end
+	elseif prev.phone and (prev.phoneCount or 0) > 0 then
+		say('Dialling ' .. prev.phoneDigits .. '.')
+	end
+	prev.phone, prev.phoneKey, prev.phoneCount, prev.phoneDigits = on, key, n, digits
+	if on then A.screenValue = (digits ~= '' and ('Number so far: ' .. digits .. '. ') or 'No digits yet. ') .. 'Key ' .. (key or '?') .. '.' end
+end
+
+-- Captions -------------------------------------------------------------------------------
+-- Words drawn as pictures (opening titles, credits, place names). Each is recognised by a
+-- fingerprint of the tiles on screen; only exact matches are spoken.
+local CAPTIONS = {
+	[278137101] = 'This story is dedicated to all those cyberpunks who fight against injustice and corruption every day of their lives.',
+	[4160089066] = 'Moscow, June 6, 1996.',
+	[2820040163] = '50 years later.',
+	[1236396727] = 'Japan.',
+	[3934140968] = 'Cast.',
+	[1592088032] = 'Gillian Seed: Jeff Lupetin.',
+	[1613554130] = 'Metal Gear: Lucy Childs.',
+	[3294450833] = 'Random Hajile: Jim Parks.',
+	[1441457580] = 'Benson Cunningham: Ray Van Steen.',
+	[3352181745] = 'Jamie Seed: Susan Mele.',
+	[3195745618] = 'Mika Slayton: Kimberley Harne.',
+	[3145688937] = 'Katrina Gibson: Lynn Foosaner.',
+	[582603916] = 'Staff.',
+	[4267799833] = 'Producer: Tomikazu Kirita.',
+	[3012167848] = 'Creator: Hideo Kojima.',
+	[2782902699] = 'Character design: Tomiharu Kinoshita.',
+	[3798256822] = 'Director: Yoshinori Sasaki.',
+	[925461108] = 'Assistant director: Mitsuhiro Togo.',
+	[3068850013] = 'Supervisor: Jeremy Blaustein.',
+	[149693222] = 'Main programmer: Masahiko Saito.',
+	[191975847] = 'Sub programmer: Hidenari Inamura.',
+	[2506473868] = 'Scenario compiler: Toshiya Adachi.',
+	[1773824719] = 'Graphic designers: Satoshi Kushibuchi and Keita Nose.',
+	[1317854262] = 'Music and sound: Konami Kukeiha Club.',
+	[3154428970] = 'Translator: Scott T. Hards.',
+	[621180609] = 'Special thanks: Michael Blaustein.',
+	[12793204] = 'Produced by Konami Co., Ltd.',
+	[2137390751] = 'Konami Omni Building, Junker Headquarters.',
+}
+local function caption_fingerprint()
+	local h, n = 0, 0
+	for r = 0, 27 do
+		local row = memory.read_bytes_as_array(0xE000 + r * 128, 80, 'VRAM')
+		for c = 0, 39 do
+			local e = row[c * 2 + 1] * 256 + row[c * 2 + 2]
+			if e % 2048 ~= 0 then
+				n = n + 1
+				h = (h * 31 + (r * 64 + c) * 7 + e) & 0xFFFFFFFF
+				if n <= 24 then
+					local t = (e % 2048) * 32
+					h = (h * 31 + memory.read_u8(t + 8, 'VRAM') * 256 + memory.read_u8(t + 20, 'VRAM')) & 0xFFFFFFFF
+				end
+			end
+		end
+	end
+	return h
+end
+local vramOK = pcall(memory.read_u8, 0, 'VRAM')
+local function captions()
+	if not vramOK or A.frame % 8 ~= 0 or u8(0x78E3) == 0x28 then return end
+	local ok, fp = pcall(caption_fingerprint)
+	if not ok then return end
+	if fp ~= prev.caption then
+		prev.caption = fp
+		local text = CAPTIONS[fp]
+		if text and text ~= prev.captionText then
+			say(text, false)
+			prev.captionText = text
+		elseif not text then
+			prev.captionText = nil
+		end
+	end
+end
+
+-- Shooting -----------------------------------------------------------------------------
+local CELLS = {[0] = 'up left', 'up', 'up right', 'left', 'center', 'right', 'down left', 'down', 'down right'}
+local shot = {active = false, cells = {}, life = nil}
+local dbg = nil
+
+local function shooting()
+	local on = u8(0x78E3) == 0x28
+	if on ~= shot.active then
+		shot.active = on
+		shot.cells = {}
+		if on then
+			shot.life = u8(0x892D)
+			say('Shooting! Life ' .. shot.life .. '.', false)
+			if not dbg then dbg = io.open(folder .. 'snatcher-shooting.log', 'a') end
+			if dbg then dbg:write(os.date('%H:%M:%S'), ' shooting start\n') end
+		else
+			if dbg then dbg:write(os.date('%H:%M:%S'), ' shooting end\n'); dbg:flush() end
+		end
+	end
+	if not on then return end
+	local spoken = 0
+	for c = 0, 8 do
+		local base = 0x8400 + c * 0x50
+		local alive = u8(base + 1) == 1
+		local st = alive and u8(base + 0x24) or 0
+		local old = shot.cells[c] or 0
+		if st ~= old then
+			if dbg then dbg:write(string.format('%d cell %d %02X->%02X\n', A.frame, c, old, st)) end
+			local kind = math.floor(st / 16)
+			local phase = st % 16
+			local oldkind = math.floor(old / 16)
+			-- A new target: state goes from empty (or another target) to an appearing phase.
+			if phase <= 2 and (old == 0 or oldkind ~= kind or (old % 16) >= 3) and (kind == 1 or kind == 2) then
+				local what = (kind == 1) and ('Enemy ' .. CELLS[c]) or ('Civilian ' .. CELLS[c] .. ", don't shoot")
+				if A.beeps and audio then audio.play(kind == 1 and 'enemy' or 'civilian', c) end
+				if A.voice then
+					say(what, spoken == 0)
+					spoken = spoken + 1
+				end
+			end
+			shot.cells[c] = st
+		end
+	end
+	local life = u8(0x892D)
+	if shot.life and life < shot.life and life < 32 then
+		if audio then audio.hit() end
+		say(life == 0 and 'Hit! Life 0. You are down.' or ('Hit! Life ' .. life .. '.'), false)
+	end
+	shot.life = life
+end
+
+function A.targets()
+	if not shot.active then return 'Not in a shooting scene.' end
+	local list = {}
+	for c = 0, 8 do
+		local st = shot.cells[c] or 0
+		local kind, phase = math.floor(st / 16), st % 16
+		if (kind == 1 or kind == 2) and phase <= 4 then
+			list[#list + 1] = ((kind == 1) and 'enemy ' or 'civilian ') .. CELLS[c]
+		end
+	end
+	local s = 'Life ' .. u8(0x892D) .. '. '
+	if #list == 0 then return s .. 'No targets showing.' end
+	return s .. table.concat(list, ', ') .. '.'
+end
+
+-- Keyboard -----------------------------------------------------------------------------
+local oldKeys = {}
+local HELP = 'Snatcher access keys. R repeats the last thing said. T reads the current message again. ' ..
+	'M reads the whole menu. L says your life and the targets showing in a shooting scene. ' ..
+	'V turns target speech on or off. B turns target sounds on or off. Control stops speech. K repeats this help.'
+
+local function keyboard()
+	local keys = input.get()
+	local function pressed(k) return keys[k] and not oldKeys[k] end
+	-- BizHawk names modifiers differently between versions, so match by name.
+	local mod, ctrl, newctrl = false, false, false
+	for k, v in pairs(keys) do
+		if v and type(k) == 'string' then
+			local n = k:lower()
+			if n:find('ctrl') or n:find('control') then
+				ctrl = true
+				if not oldKeys[k] then newctrl = true end
+			elseif n:find('alt') or n:find('shift') then mod = true end
+		end
+	end
+	if newctrl then stop_speech() end
+	if not (mod or ctrl) then
+		if pressed('R') then say(last_said)
+		elseif pressed('T') then
+			if u8(0x9740) ~= 0 then last_message = read_message() end
+			say(last_message ~= '' and last_message or 'No message yet.')
+		elseif pressed('M') then
+			if A.screenValue then say(A.screenValue)
+			elseif u8(0x788D) == 1 then
+				local items = menu_items()
+				if items then say('Menu: ' .. table.concat(items, ', ') .. '. Selected: ' .. items[(u8(0x9710) % #items) + 1] .. '.')
+				else say('No menu.') end
+			else say('No menu on screen.') end
+		elseif pressed('L') then say(A.targets())
+		elseif pressed('V') then A.voice = not A.voice; say(A.voice and 'Target speech on.' or 'Target speech off.')
+		elseif pressed('B') then
+			A.beeps = not A.beeps
+			say(audio and (A.beeps and 'Target sounds on.' or 'Target sounds off.') or 'Target sounds are unavailable.')
+		elseif pressed('K') then say(HELP) end
+	end
+	oldKeys = keys
+end
+
+-- Main loop ----------------------------------------------------------------------------
+function A.tick()
+	A.frame = A.frame + 1
+	A.screenValue = nil
+	system_screens()
+	phone()
+	captions()
+	dialogue()
+	menus()
+	shooting()
+	keyboard()
+end
+
+function A.shutdown()
+	if audio then pcall(audio.close); audio = nil end
+	if sapi then pcall(function() sapi:SpeakAsyncCancelAll(); sapi:Dispose() end); sapi = nil end
+	if log then log:close(); log = nil end
+	if dbg then dbg:close(); dbg = nil end
+end
+
+local function reset_state()
+	prev = {}; menuKey = nil; shot = {active = false, cells = {}, life = nil}
+end
+A.hooks[#A.hooks + 1] = event.onloadstate(reset_state, 'Snatcher access state reset')
+A.hooks[#A.hooks + 1] = event.onexit(function() A.shutdown() end, 'Snatcher access cleanup')
+
+say('Snatcher access version ' .. A.version .. ' ready. Press K for help.')
+if SNATCHER_NO_LOOP then return A end
+while true do
+	local ok, err = pcall(A.tick)
+	if not ok then
+		say('Snatcher access stopped because of an error: ' .. tostring(err))
+		A.shutdown()
+		break
+	end
+	emu.frameadvance()
+end
