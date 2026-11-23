@@ -20,7 +20,7 @@ Get the latest zip from the [Releases page](../../releases/latest).
 2. Open BizHawk and load your Snatcher (USA) disc image.
 3. Open the Tools menu, then Lua Console.
 4. In the Lua Console, open the Script menu, choose Open Script, and pick `snatcher-access.lua`.
-5. You hear "Snatcher access version 0.1 ready". Go back to the game window.
+5. You hear Snatcher Access say that it is ready, with its version number. Go back to the game window.
 
 ## Speech
 

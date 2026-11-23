@@ -1,4 +1,4 @@
--- Snatcher Access, version 0.1
+-- Snatcher Access, version 0.2
 -- Screen reader support for Snatcher (USA, Sega CD) in BizHawk (Genesis Plus GX core).
 -- Reads dialogue with speaker names, every command menu, the title/options/backup RAM
 -- screens, and announces targets during shooting scenes with speech and positional sounds.
@@ -15,14 +15,14 @@
 --   0x9852/0x9853    menu capacity / item count, then word offsets of item names from 0x1E000
 --   0x9710           menu cursor
 --   0x78BA (word)    button layout 0-5 (Options > Controls)
---   0x78E3           0x28 during shooting scenes
+--   0x78E9           shooting scene phase: 1 getting ready, 2 targets coming, 3-5 ending, 0 none
 --   0x892D           life during shooting scenes
 --   0x8400 + n*0x50  shooting object n (n = grid cell 0-8): +1 active, +0x24 state
 --                    (high nibble 1 = enemy/Snatcher, 2 = civilian; low nibble 0-2 appearing,
 --                    3-5 leaving, 7 destroyed)
 --   0x7897/0x7899    system screen (0/2 backup RAM choice, 9/2 title, 0B options)
 
-local A = {version = '0.1', frame = 0, hooks = {}}
+local A = {version = '0.2', frame = 0, hooks = {}}
 local source = debug.getinfo(1, 'S').source:sub(2)
 local folder = source:match('^(.*[/\\])') or './'
 local D = 'CD PRG RAM'
@@ -400,7 +400,7 @@ local function caption_fingerprint()
 end
 local vramOK = pcall(memory.read_u8, 0, 'VRAM')
 local function captions()
-	if not vramOK or A.frame % 8 ~= 0 or u8(0x78E3) == 0x28 then return end
+	if not vramOK or A.frame % 8 ~= 0 or u8(0x78E9) ~= 0 then return end
 	local ok, fp = pcall(caption_fingerprint)
 	if not ok then return end
 	if fp ~= prev.caption then
@@ -421,7 +421,8 @@ local shot = {active = false, cells = {}, life = nil}
 local dbg = nil
 
 local function shooting()
-	local on = u8(0x78E3) == 0x28
+	local phase = u8(0x78E9)
+	local on = phase == 1 or phase == 2
 	if on ~= shot.active then
 		shot.active = on
 		shot.cells = {}
@@ -451,7 +452,8 @@ local function shooting()
 				local what = (kind == 1) and ('Enemy ' .. CELLS[c]) or ('Civilian ' .. CELLS[c] .. ", don't shoot")
 				if A.beeps and audio then audio.play(kind == 1 and 'enemy' or 'civilian', c) end
 				if A.voice then
-					say(what, spoken == 0)
+					-- Enemies cut in at once; civilians wait their turn so they never cut off an enemy.
+					say(what, kind == 1 and spoken == 0)
 					spoken = spoken + 1
 				end
 			end
