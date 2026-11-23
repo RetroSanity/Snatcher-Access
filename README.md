@@ -26,6 +26,10 @@ Get the latest zip from the [Releases page](../../releases/latest).
 
 The mod speaks through [Prism](https://github.com/ethindp/prism) (`prism.dll`, included), which works with NVDA, JAWS, Narrator and other screen readers, or a Windows voice if no screen reader is running. If Prism cannot start, the mod uses BizHawk's own speech if your BizHawk has it (`speech.say`), and otherwise the Windows voice. Everything said is also written to `snatcher-speech.log` next to the script.
 
+### No speech?
+
+Every time the script starts, it writes `snatcher-debug.log` next to `snatcher-access.lua`. It records which voice the mod found (Prism, BizHawk speech or the Windows voice) and why any of them failed. Please attach `snatcher-debug.log` and `snatcher-speech.log` when you report a problem.
+
 ## Starting the game
 
 At the backup memory question, choose Internal backup RAM (Up and Down, then Start). At the title screen choose New game or Continue with Up and Down, then press Start.

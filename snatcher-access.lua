@@ -1,4 +1,4 @@
--- Snatcher Access, version 0.22
+-- Snatcher Access, version 0.23
 -- Screen reader support for Snatcher (USA, Sega CD) in BizHawk (Genesis Plus GX core).
 -- Reads dialogue with speaker names, every command menu, the title/options/backup RAM
 -- screens, and announces targets during shooting scenes with speech and positional sounds.
@@ -22,12 +22,23 @@
 --                    3-5 leaving, 7 destroyed)
 --   0x7897/0x7899    system screen (0/2 backup RAM choice, 9/2 title, 0B options)
 
-local A = {version = '0.22', frame = 0, hooks = {}}
+local A = {version = '0.23', frame = 0, hooks = {}}
 local source = debug.getinfo(1, 'S').source:sub(2)
 local folder = source:match('^(.*[/\\])') or './'
 local D = 'CD PRG RAM'
 
 local log = io.open(folder .. 'snatcher-speech.log', 'a')
+
+-- snatcher-debug.log is rewritten every time the script starts. It records how speech was
+-- set up and anything that went wrong, so a player with no speech can send it in.
+local dbglog = io.open(folder .. 'snatcher-debug.log', 'w')
+local function note(s)
+	console.log(s)
+	if dbglog then dbglog:write(os.date('%Y-%m-%d %H:%M:%S '), tostring(s), '\n'); dbglog:flush() end
+end
+note('Snatcher Access ' .. A.version .. ' starting from ' .. folder)
+pcall(function() note('BizHawk ' .. tostring(client.getversion())) end)
+note('luanet: ' .. tostring(luanet ~= nil) .. ', BizHawk speech module: ' .. tostring(speech ~= nil and speech.say ~= nil))
 local last_said, last_message = '', ''
 
 -- Speech ----------------------------------------------------------------------------------
@@ -53,7 +64,8 @@ end
 local function start_prism()
 	if not luanet or SNATCHER_NO_PRISM then return nil end
 	local dll = find_prism()
-	if not dll then return nil end
+	if not dll then note('Prism: prism.dll not found next to the script or in the BizHawk folder'); return nil end
+	note('Prism: using ' .. dll)
 	dll = dll:gsub('/', '\\')
 	luanet.load_assembly('System')
 	local code = [[
@@ -95,20 +107,23 @@ public static class SnatcherPrism {
 	sources:SetValue(code, 0)
 	local result = Provider():CompileAssemblyFromSource(params, sources)
 	if result.Errors.HasErrors then
-		console.log('Prism bridge did not compile: ' .. tostring(result.Errors:get_Item(0)))
+		local msg = '?'
+		pcall(function() msg = tostring(result.Errors:get_Item(0)) end)
+		note('Prism: bridge did not compile: ' .. msg)
 		return nil
 	end
 	local t = result.CompiledAssembly:GetType('SnatcherPrism')
 	local mSpeak, mStop = t:GetMethod('Speak'), t:GetMethod('Stop')
 	local name = t:GetMethod('Start'):Invoke(nil, nil)
-	if name == nil then return nil end
+	if name == nil then note('Prism: started, but no screen reader or voice was available'); return nil end
 	local args = Array.CreateInstance(ObjectT, 2)
 	return {
 		name = tostring(name),
 		say = function(text, interrupt)
 			args:SetValue(text, 0); args:SetValue(interrupt and true or false, 1)
-			local r = mSpeak:Invoke(nil, args)
-			return tonumber(tostring(r)) == 0
+			local r = tonumber(tostring(mSpeak:Invoke(nil, args)))
+			if r ~= 0 then return false, 'error code ' .. tostring(r) end
+			return true
 		end,
 		stop = function() mStop:Invoke(nil, nil) end,
 	}
@@ -117,31 +132,40 @@ if SNATCHER_PRISM then
 	prism = SNATCHER_PRISM   -- already started before an automatic update restarted the script
 else
 	local ok, p = pcall(start_prism)
-	if ok and p then prism = p; SNATCHER_PRISM = p; console.log('Speech through Prism (' .. p.name .. ').')
-	elseif not ok then console.log('Prism unavailable: ' .. tostring(p)) end
+	if ok and p then prism = p; SNATCHER_PRISM = p; note('Prism: speaking through ' .. p.name)
+	elseif not ok then note('Prism: failed to start: ' .. tostring(p)) end
 end
 
-local sapi = nil
-if not prism and not (speech and speech.say) and luanet then
-	pcall(function()
-		luanet.load_assembly('System.Speech')
+-- The Windows voice. BizHawk can only load System.Speech by its full name.
+local sapi, sapiTried = nil, false
+local function get_sapi()
+	if sapi or sapiTried or not luanet then return sapi end
+	sapiTried = true
+	local ok, err = pcall(function()
+		luanet.load_assembly('System.Speech, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35')
 		local Synth = luanet.import_type('System.Speech.Synthesis.SpeechSynthesizer')
 		sapi = Synth()
 		sapi.Rate = 2
 	end)
+	if ok and sapi then note('Windows voice ready as a backup') else note('Windows voice unavailable: ' .. tostring(err)); sapi = nil end
+	return sapi
 end
+if not prism and not (speech and speech.say) then get_sapi() end
+local failures = 0
 local function say(s, interrupt)
 	if not s or s == '' then return end
 	last_said = s
 	console.log(s)
 	if log then log:write(os.date('%H:%M:%S '), s, '\n'); log:flush() end
 	if prism then
-		local ok, spoke = pcall(prism.say, s, interrupt ~= false)
+		local ok, spoke, why = pcall(prism.say, s, interrupt ~= false)
 		if ok and spoke then return end
+		failures = failures + 1
+		if failures <= 5 then note('Prism could not speak (' .. tostring(ok and why or spoke) .. '); using a backup voice') end
 	end
 	if speech and speech.say then
 		if interrupt == false then speech.say(s, false) else speech.say(s) end
-	elseif sapi then
+	elseif get_sapi() then
 		pcall(function()
 			if interrupt ~= false then sapi:SpeakAsyncCancelAll() end
 			sapi:SpeakAsync(s)
@@ -169,7 +193,7 @@ if not okDomain then
 	return
 end
 if not prism and not (speech and speech.say) and not sapi then
-	console.log('Speech output is unavailable: no Prism, no BizHawk speech module and no Windows voice.')
+	note('NO SPEECH: Prism, BizHawk speech and the Windows voice are all unavailable.')
 end
 
 -- Automatic updates ---------------------------------------------------------------------
@@ -180,7 +204,7 @@ end
 -- file called no-update.txt next to this script. Nothing is changed if anything goes wrong.
 local REPO = 'RetroSanity/Snatcher-Access'
 local function update_log(s)
-	console.log('Update: ' .. s)
+	note('Update: ' .. s)
 	if log then log:write(os.date('%H:%M:%S '), 'Update: ', s, '\n'); log:flush() end
 end
 local function http_get(url, binary)
@@ -290,7 +314,7 @@ local audioOK, audio = pcall(function()
 	}
 end)
 if not audioOK or not audio then
-	console.log('Target sounds unavailable: ' .. tostring(audio))
+	note('Target sounds unavailable: ' .. tostring(audio))
 	audio = nil
 end
 

@@ -1,4 +1,4 @@
-SNATCHER ACCESS, version 0.22
+SNATCHER ACCESS, version 0.23
 A screen reader mod for Snatcher (USA, Sega CD), played in the BizHawk emulator.
 It reads the game aloud so blind players can play it from start to finish.
 
@@ -27,6 +27,12 @@ JAWS, Narrator and other screen readers, or a Windows voice if no screen
 reader is running. If Prism cannot start, it uses BizHawk's own speech if
 your BizHawk has it, and otherwise the Windows voice.
 Everything said is also written to snatcher-speech.log next to the script.
+
+IF YOU HEAR NO SPEECH
+Every time the script starts, it writes snatcher-debug.log next to
+snatcher-access.lua. It says which voice the mod found and why any of them
+failed. Please send snatcher-debug.log and snatcher-speech.log with your
+report. The BizHawk Lua Console shows the same messages.
 
 STARTING THE GAME
 At the backup memory question, choose Internal backup RAM (Up and Down,
