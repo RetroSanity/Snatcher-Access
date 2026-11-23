@@ -1,4 +1,4 @@
--- Snatcher Access, version 0.24
+-- Snatcher Access, version 0.25
 -- Screen reader support for Snatcher (USA, Sega CD) in BizHawk (Genesis Plus GX core).
 -- Reads dialogue with speaker names, every command menu, the title/options/backup RAM
 -- screens, and announces targets during shooting scenes with speech and positional sounds.
@@ -22,7 +22,7 @@
 --                    3-5 leaving, 7 destroyed)
 --   0x7897/0x7899    system screen (0/2 backup RAM choice, 9/2 title, 0B options)
 
-local A = {version = '0.24', frame = 0, hooks = {}}
+local A = {version = '0.25', frame = 0, hooks = {}}
 local source = debug.getinfo(1, 'S').source:sub(2)
 local folder = source:match('^(.*[/\\])')
 if not folder then
@@ -60,6 +60,17 @@ local last_said, last_message = '', ''
 -- 2. BizHawk builds with their own speech module (speech.say).
 -- 3. The Windows voice (SAPI) as a last resort.
 local prism = nil
+-- Turns an error from a .NET call into readable text, with the real exception inside it.
+local function explain(err)
+	local why = tostring(err)
+	pcall(function()
+		local e = err
+		if e.InnerException then e = e.InnerException end
+		e = e:GetBaseException()
+		why = e:GetType().FullName .. ': ' .. tostring(e.Message)
+	end)
+	return why
+end
 local function find_prism()
 	local dirs = {folder, folder .. '..\\Snatcher Access\\'}
 	pcall(function()
@@ -82,36 +93,58 @@ local function start_prism()
 	luanet.load_assembly('System')
 	local code = [[
 using System; using System.Runtime.InteropServices; using System.Text;
-public static class SnatcherPrism {
+using System.Runtime.ExceptionServices; using System.Security;
+public class SnatcherPrism {
 	const string D = @"DLLPATH";
+	[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryW(string path);
 	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern IntPtr prism_init(IntPtr cfg);
 	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern IntPtr prism_registry_create_best(IntPtr ctx);
 	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern int prism_backend_speak(IntPtr b, byte[] text, [MarshalAs(UnmanagedType.I1)] bool interrupt);
 	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern int prism_backend_stop(IntPtr b);
 	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern IntPtr prism_backend_name(IntPtr b);
-	[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryW(string path);
 	static IntPtr ctx, backend;
-	public static string Start() {
+	public string LastError = "";
+	static string Describe(Exception e) {
+		while (e.InnerException != null) e = e.InnerException;
+		return e.GetType().FullName + ": " + e.Message;
+	}
+	// Returns the backend name, or text starting with ! saying what went wrong.
+	[HandleProcessCorruptedStateExceptions, SecurityCritical]
+	public string Start() {
 		try {
-			if (LoadLibraryW(D) == IntPtr.Zero)
-				return "!Windows could not load " + D + " (error " + Marshal.GetLastWin32Error() + ": " + new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message + ")";
+			if (backend != IntPtr.Zero) return Name();
+			if (LoadLibraryW(D) == IntPtr.Zero) {
+				int err = Marshal.GetLastWin32Error();
+				return "!Windows could not load " + D + " (error " + err + ": " + new System.ComponentModel.Win32Exception(err).Message + ")";
+			}
 			ctx = prism_init(IntPtr.Zero);
 			if (ctx == IntPtr.Zero) return "!prism_init returned nothing";
 			backend = prism_registry_create_best(ctx);
 			if (backend == IntPtr.Zero) return "!no screen reader or voice was found";
-			IntPtr n = prism_backend_name(backend);
-			return n == IntPtr.Zero ? "speech" : Marshal.PtrToStringAnsi(n);
-		} catch (Exception e) {
-			return "!" + e.GetType().Name + ": " + e.Message;
-		}
+			return Name();
+		} catch (Exception e) { return "!" + Describe(e); }
 	}
-	public static int Speak(string text, bool interrupt) {
-		if (backend == IntPtr.Zero) return -1;
-		try { return prism_backend_speak(backend, Encoding.UTF8.GetBytes(text + "\0"), interrupt); }
-		catch (Exception) { return -2; }
+	string Name() {
+		IntPtr n = prism_backend_name(backend);
+		return n == IntPtr.Zero ? "speech" : Marshal.PtrToStringAnsi(n);
 	}
-	public static int Stop() {
-		try { return backend == IntPtr.Zero ? -1 : prism_backend_stop(backend); } catch (Exception) { return -2; }
+	// 0 = spoken. Anything else is an error; LastError then says what happened.
+	[HandleProcessCorruptedStateExceptions, SecurityCritical]
+	public int Speak(string text, bool interrupt) {
+		try {
+			if (backend == IntPtr.Zero) { LastError = "Prism is not started"; return -1; }
+			byte[] utf8 = Encoding.UTF8.GetBytes((text ?? "") + "\0");
+			int r = prism_backend_speak(backend, utf8, interrupt);
+			if (r != 0) LastError = "prism_backend_speak returned error " + r;
+			return r;
+		} catch (Exception e) { LastError = Describe(e); return -2; }
+	}
+	public int SpeakNow(string text) { return Speak(text, true); }
+	public int SpeakQueued(string text) { return Speak(text, false); }
+	[HandleProcessCorruptedStateExceptions, SecurityCritical]
+	public int Stop() {
+		try { return backend == IntPtr.Zero ? -1 : prism_backend_stop(backend); }
+		catch (Exception e) { LastError = Describe(e); return -2; }
 	}
 }]]
 	code = code:gsub('DLLPATH', function() return dll end)
@@ -120,7 +153,6 @@ public static class SnatcherPrism {
 	local Array = luanet.import_type('System.Array')
 	local TypeT = luanet.import_type('System.Type')
 	local StringT = TypeT.GetType('System.String')
-	local ObjectT = TypeT.GetType('System.Object')
 	local params = Params()
 	params.GenerateInMemory = true
 	params.GenerateExecutable = false
@@ -134,28 +166,25 @@ public static class SnatcherPrism {
 		note('Prism: bridge did not compile: ' .. msg)
 		return nil
 	end
-	local t = result.CompiledAssembly:GetType('SnatcherPrism')
-	local mSpeak, mStop = t:GetMethod('Speak'), t:GetMethod('Stop')
-	local okStart, name = pcall(function() return t:GetMethod('Start'):Invoke(nil, nil) end)
-	if not okStart then
-		local why = tostring(name)
-		pcall(function() local b = name:GetBaseException(); why = b:GetType().FullName .. ': ' .. b.Message end)
-		pcall(function() local b = name.InnerException:GetBaseException(); why = b:GetType().FullName .. ': ' .. b.Message end)
-		note('Prism: crashed while starting: ' .. why)
-		return nil
-	end
+	-- Lua calls the bridge object's methods directly, so BizHawk converts the text and the
+	-- true/false itself instead of going through reflection.
+	local bridge = result.CompiledAssembly:CreateInstance('SnatcherPrism')
+	if not bridge then note('Prism: the bridge could not be created'); return nil end
+	local okStart, name = pcall(function() return bridge:Start() end)
+	if not okStart then note('Prism: crashed while starting: ' .. explain(name)); return nil end
 	name = name and tostring(name)
 	if not name or name:sub(1, 1) == '!' then note('Prism: could not start: ' .. tostring(name and name:sub(2))); return nil end
-	local args = Array.CreateInstance(ObjectT, 2)
 	return {
-		name = tostring(name),
+		name = name,
 		say = function(text, interrupt)
-			args:SetValue(text, 0); args:SetValue(interrupt and true or false, 1)
-			local r = tonumber(tostring(mSpeak:Invoke(nil, args)))
-			if r ~= 0 then return false, 'error code ' .. tostring(r) end
+			local ok, r = pcall(function()
+				if interrupt then return bridge:SpeakNow(text) else return bridge:SpeakQueued(text) end
+			end)
+			if not ok then return false, explain(r) end
+			if tonumber(tostring(r)) ~= 0 then return false, tostring(bridge.LastError) end
 			return true
 		end,
-		stop = function() mStop:Invoke(nil, nil) end,
+		stop = function() bridge:Stop() end,
 	}
 end
 if SNATCHER_PRISM then
@@ -192,6 +221,7 @@ local function say(s, interrupt)
 		if ok and spoke then return end
 		failures = failures + 1
 		if failures <= 5 then note('Prism could not speak (' .. tostring(ok and why or spoke) .. '); using a backup voice') end
+		if failures >= 3 then prism = nil; note('Prism turned off after 3 failures; using the backup voice from now on') end
 	end
 	if speech and speech.say then
 		if interrupt == false then speech.say(s, false) else speech.say(s) end
