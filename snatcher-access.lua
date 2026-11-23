@@ -1,4 +1,4 @@
--- Snatcher Access, version 0.26
+-- Snatcher Access, version 0.27
 -- Screen reader support for Snatcher (USA, Sega CD) in BizHawk (Genesis Plus GX core).
 -- Reads dialogue with speaker names, every command menu, the title/options/backup RAM
 -- screens, and announces targets during shooting scenes with speech and positional sounds.
@@ -22,7 +22,7 @@
 --                    3-5 leaving, 7 destroyed)
 --   0x7897/0x7899    system screen (0/2 backup RAM choice, 9/2 title, 0B options)
 
-local A = {version = '0.26', frame = 0, hooks = {}}
+local A = {version = '0.27', frame = 0, hooks = {}}
 local source = debug.getinfo(1, 'S').source:sub(2)
 local folder = source:match('^(.*[/\\])')
 if not folder then
@@ -215,8 +215,23 @@ local function get_sapi()
 end
 if not prism and not (speech and speech.say) then get_sapi() end
 local failures = 0
+-- Player input since the last thing said. New dialogue and menus only cut off the line being
+-- spoken when the player pressed something, so lines that follow on by themselves are queued.
+local presses, pressesAtSay, padWas = 0, 0, {}
+local PAD = {'Up', 'Down', 'Left', 'Right', 'A', 'B', 'C', 'Start', 'X', 'Y', 'Z', 'Mode'}
+local function watch_pad()
+	local ok, pad = pcall(joypad.getimmediate)
+	if not ok or type(pad) ~= 'table' then return end
+	for _, b in ipairs(PAD) do
+		local down = pad['P1 ' .. b] and true or false
+		if down and not padWas[b] then presses = presses + 1 end
+		padWas[b] = down
+	end
+end
+local function player_acted() return presses ~= pressesAtSay end
 local function say(s, interrupt)
 	if not s or s == '' then return end
+	pressesAtSay = presses
 	last_said = s
 	console.log(s)
 	if log then log:write(os.date('%H:%M:%S '), s, '\n'); log:flush() end
@@ -447,7 +462,6 @@ end
 
 -- State --------------------------------------------------------------------------------
 local prev = {}
-local msgFrame = -1000
 local menuKey = nil
 
 local function read_message()
@@ -467,8 +481,7 @@ local function dialogue()
 			local t = read_message()
 			if t ~= '' then
 				last_message = t
-				say(t)
-				msgFrame = A.frame
+				say(t, player_acted())
 			end
 		end
 	end
@@ -489,8 +502,8 @@ local function menus()
 	if cur >= #items then prev.menuActive = true; return end
 	local line = items[cur + 1] .. ', ' .. (cur + 1) .. ' of ' .. #items
 	if key ~= menuKey or not prev.menuActive then
-		-- A menu that opens right after a line of dialogue waits for that line.
-		say(line, (A.frame - msgFrame) > 150)
+		-- A menu that comes back by itself after dialogue waits for that line to finish.
+		say(line, player_acted())
 		menuKey = key
 	elseif cur ~= prev.cursor then
 		say(line)
@@ -512,11 +525,15 @@ local CONTROLS = {
 	'A cancel, B draw blaster, C select and shoot', 'A select and shoot, B draw blaster, C cancel',
 	'A select and shoot, B cancel, C draw blaster', 'A cancel, B select and shoot, C draw blaster'}
 local function option_line(c)
-	if c == 0 then return 'Device, ' .. (u8(0x78B9) == 1 and 'joypad and gun' or 'joypad only') .. ', 1 of 5'
-	elseif c == 1 then return 'Controls, ' .. (CONTROLS[u8(0x78BB)] or 'unknown') .. ', 2 of 5'
-	elseif c == 2 then return 'Sound mode, ' .. (u8(0x78A3) == 1 and 'mono' or 'stereo') .. ', 3 of 5'
-	elseif c == 3 then return 'Gun adjust, 4 of 5'
-	elseif c == 4 then return 'Quit, 5 of 5. Press C to leave options and start.' end
+	-- Gun adjust only appears when the device is set to joypad and gun.
+	local gun = u8(0x78B9) == 1
+	local n = gun and 5 or 4
+	local of = ' of ' .. n
+	if c == 0 then return 'Device, ' .. (gun and 'joypad and gun' or 'joypad only') .. ', 1' .. of
+	elseif c == 1 then return 'Controls, ' .. (CONTROLS[u8(0x78BB)] or 'unknown') .. ', 2' .. of
+	elseif c == 2 then return 'Sound mode, ' .. (u8(0x78A3) == 1 and 'mono' or 'stereo') .. ', 3' .. of
+	elseif c == 3 then return 'Gun adjust, 4' .. of
+	elseif c == 4 then return 'Quit, ' .. n .. of .. '. Press C to leave options and start.' end
 	return nil
 end
 
@@ -649,10 +666,12 @@ local CAPTIONS = {
 }
 local function caption_fingerprint()
 	local h, n = 0, 0
+	-- One read for the whole screen (28 rows of 64 tiles, 2 bytes each) instead of one per row.
+	local nt = memory.read_bytes_as_array(0xE000, 28 * 128, 'VRAM')
 	for r = 0, 27 do
-		local row = memory.read_bytes_as_array(0xE000 + r * 128, 80, 'VRAM')
+		local base = r * 128
 		for c = 0, 39 do
-			local e = row[c * 2 + 1] * 256 + row[c * 2 + 2]
+			local e = nt[base + c * 2 + 1] * 256 + nt[base + c * 2 + 2]
 			if e % 2048 ~= 0 then
 				n = n + 1
 				h = (h * 31 + (r * 64 + c) * 7 + e) & 0xFFFFFFFF
@@ -898,6 +917,7 @@ end
 -- Main loop ----------------------------------------------------------------------------
 function A.tick()
 	A.frame = A.frame + 1
+	watch_pad()
 	A.screenValue = nil
 	system_screens()
 	phone()
