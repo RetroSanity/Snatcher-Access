@@ -58,7 +58,11 @@ Voiced scenes have no text in this version of the game, so the mod stays quiet w
 
 Enemies appear in one of nine spots: up left, up, up right, left, center, right, down left, down, down right. Each one is spoken ("Enemy up left", "Civilian right, don't shoot") and plays a sound. Left and right in your headphones match the screen. A high pitch is the top row and a low pitch is the bottom. Enemies beep twice; civilians make one soft falling tone.
 
-Press A to draw your blaster, hold the D pad toward the target (both directions for corners, nothing for the center) and press C to shoot. Getting hit plays a buzz and says your life, like "Hit! Life 4".
+**Aim assist** is on by default (G turns it off and on). At the start of each shooting scene it draws your blaster for you ("Blaster ready"), and it points your aim at the oldest enemy on screen, so you only need to press C when you hear "Enemy". Holding the D pad yourself always overrides it, and it never aims at civilians.
+
+Without aim assist: press A to draw your blaster, hold the D pad toward the target (both directions for corners, nothing for the center) and press C to shoot.
+
+A short chime means you destroyed an enemy. Shooting a civilian says "You shot a civilian!". Getting hit plays a buzz and says your life, like "Hit! Life 4".
 
 The Junker HQ shooting range uses the same nine spots, so practise there.
 
@@ -76,6 +80,7 @@ Choose Use Metal Gear, Videophone, Call. The arrows move between keys and each k
 | L | Life and targets in a shooting scene |
 | V | Spoken target positions on or off |
 | B | Target sounds on or off |
+| G | Aim assist on or off |
 | Control | Stop speech |
 | K | Help |
 

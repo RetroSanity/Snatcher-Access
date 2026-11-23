@@ -1,4 +1,4 @@
--- Snatcher Access, version 0.2
+-- Snatcher Access, version 0.21
 -- Screen reader support for Snatcher (USA, Sega CD) in BizHawk (Genesis Plus GX core).
 -- Reads dialogue with speaker names, every command menu, the title/options/backup RAM
 -- screens, and announces targets during shooting scenes with speech and positional sounds.
@@ -22,7 +22,7 @@
 --                    3-5 leaving, 7 destroyed)
 --   0x7897/0x7899    system screen (0/2 backup RAM choice, 9/2 title, 0B options)
 
-local A = {version = '0.2', frame = 0, hooks = {}}
+local A = {version = '0.21', frame = 0, hooks = {}}
 local source = debug.getinfo(1, 'S').source:sub(2)
 local folder = source:match('^(.*[/\\])') or './'
 local D = 'CD PRG RAM'
@@ -81,6 +81,7 @@ end
 -- Sounds --------------------------------------------------------------------------------
 A.beeps = true      -- positional target sounds
 A.voice = true      -- spoken target positions
+A.aim = true        -- aim assist: draw the blaster and point it at the oldest enemy
 -- Sounds live next to the script, or in D:\Games\Pokemon\Snatcher Access\sounds when the
 -- script is run from another folder (such as the Lua folder).
 local function find_sounds()
@@ -105,12 +106,16 @@ local audioOK, audio = pcall(function()
 		end
 	end
 	local hit = SoundPlayer(SOUNDS .. 'hit.wav'); hit:Load(); t.hit = hit
+	local okKill, kill = pcall(function() local k = SoundPlayer(SOUNDS .. 'kill.wav'); k:Load(); return k end)
+	if okKill then t.kill = kill end
 	return {
 		play = function(kind, cell) local p = t[kind] and t[kind][cell]; if p then p:Play() end end,
 		hit = function() t.hit:Play() end,
+		kill = function() if t.kill then t.kill:Play() end end,
 		close = function()
 			for _, kind in ipairs({'enemy', 'civilian'}) do for c = 0, 8 do pcall(function() t[kind][c]:Dispose() end) end end
 			pcall(function() t.hit:Dispose() end)
+			pcall(function() if t.kill then t.kill:Dispose() end end)
 		end,
 	}
 end)
@@ -417,18 +422,59 @@ end
 
 -- Shooting -----------------------------------------------------------------------------
 local CELLS = {[0] = 'up left', 'up', 'up right', 'left', 'center', 'right', 'down left', 'down', 'down right'}
-local shot = {active = false, cells = {}, life = nil}
+local shot = {active = false, cells = {}, born = {}, life = nil}
 local dbg = nil
+
+-- Directions that point the blaster at each grid cell (nothing held means the center).
+local AIM = {[0] = {Up = true, Left = true}, {Up = true}, {Up = true, Right = true}, {Left = true}, {},
+	{Right = true}, {Down = true, Left = true}, {Down = true}, {Down = true, Right = true}}
+local function player_aiming()
+	local ok, pad = pcall(joypad.getimmediate)
+	if not ok or type(pad) ~= 'table' then return false end
+	for _, d in ipairs({'Up', 'Down', 'Left', 'Right'}) do
+		if pad['P1 ' .. d] or pad[d] then return true end
+	end
+	return false
+end
+local function press(buttons)
+	local t = {}
+	for k, v in pairs(buttons) do t['P1 ' .. k] = v end
+	pcall(joypad.set, t)
+end
+
+local function aim_assist(phase)
+	if not A.aim or phase ~= 2 then return end
+	-- Draw the blaster once at the start of each scene (whichever button Options gives "draw").
+	if u8(0x80E1) == 0 and (shot.drawTries or 0) < 3 and A.frame >= (shot.drawAt or 0) then
+		local letter = BTN[0xEC][u16(0x78BA) + 1] or 'A'
+		press({[letter] = true})
+		shot.drawTries = (shot.drawTries or 0) + 1
+		shot.drawAt = A.frame + 20
+		return
+	end
+	if player_aiming() then return end     -- your own D pad always wins
+	local best, born = nil, nil
+	for c = 0, 8 do
+		local st = shot.cells[c] or 0
+		local kind, ph = math.floor(st / 16), st % 16
+		if kind == 1 and ph >= 1 and ph <= 4 and (not born or shot.born[c] < born) then best, born = c, shot.born[c] end
+	end
+	if best then
+		local dir = AIM[best]
+		press({Up = dir.Up or false, Down = dir.Down or false, Left = dir.Left or false, Right = dir.Right or false})
+	end
+end
 
 local function shooting()
 	local phase = u8(0x78E9)
 	local on = phase == 1 or phase == 2
 	if on ~= shot.active then
 		shot.active = on
-		shot.cells = {}
+		shot.cells, shot.born = {}, {}
+		shot.drawTries, shot.drawAt, shot.drawn = nil, nil, nil
 		if on then
 			shot.life = u8(0x892D)
-			say('Shooting! Life ' .. shot.life .. '.', false)
+			say('Shooting! Life ' .. shot.life .. '.' .. (A.aim and ' Aim assist on.' or ''), false)
 			if not dbg then dbg = io.open(folder .. 'snatcher-shooting.log', 'a') end
 			if dbg then dbg:write(os.date('%H:%M:%S'), ' shooting start\n') end
 		else
@@ -436,6 +482,12 @@ local function shooting()
 		end
 	end
 	if not on then return end
+	local drawn = u8(0x80E1) == 1
+	if drawn then shot.drawTries = 99 end   -- drawn once: from now on holstering is your choice
+	if shot.drawn ~= nil and drawn ~= shot.drawn and phase == 2 then
+		say(drawn and 'Blaster ready.' or 'Blaster away.', false)
+	end
+	shot.drawn = drawn
 	local spoken = 0
 	for c = 0, 8 do
 		local base = 0x8400 + c * 0x50
@@ -445,10 +497,11 @@ local function shooting()
 		if st ~= old then
 			if dbg then dbg:write(string.format('%d cell %d %02X->%02X\n', A.frame, c, old, st)) end
 			local kind = math.floor(st / 16)
-			local phase = st % 16
+			local ph = st % 16
 			local oldkind = math.floor(old / 16)
 			-- A new target: state goes from empty (or another target) to an appearing phase.
-			if phase <= 2 and (old == 0 or oldkind ~= kind or (old % 16) >= 3) and (kind == 1 or kind == 2) then
+			if ph <= 2 and (old == 0 or oldkind ~= kind or (old % 16) >= 3) and (kind == 1 or kind == 2) then
+				shot.born[c] = A.frame
 				local what = (kind == 1) and ('Enemy ' .. CELLS[c]) or ('Civilian ' .. CELLS[c] .. ", don't shoot")
 				if A.beeps and audio then audio.play(kind == 1 and 'enemy' or 'civilian', c) end
 				if A.voice then
@@ -456,6 +509,15 @@ local function shooting()
 					say(what, kind == 1 and spoken == 0)
 					spoken = spoken + 1
 				end
+			-- Shot: an enemy passes through 6 to 7, a civilian jumps straight to 7.
+			elseif ph == 7 and (old % 16) ~= 7 and (old % 16) ~= 6 then
+				if kind == 1 then
+					if A.beeps and audio then audio.kill() end
+				elseif kind == 2 then
+					say('You shot a civilian!')
+				end
+			elseif ph == 6 and kind == 1 then
+				if A.beeps and audio then audio.kill() end
 			end
 			shot.cells[c] = st
 		end
@@ -466,6 +528,7 @@ local function shooting()
 		say(life == 0 and 'Hit! Life 0. You are down.' or ('Hit! Life ' .. life .. '.'), false)
 	end
 	shot.life = life
+	aim_assist(phase)
 end
 
 function A.targets()
@@ -487,7 +550,8 @@ end
 local oldKeys = {}
 local HELP = 'Snatcher access keys. R repeats the last thing said. T reads the current message again. ' ..
 	'M reads the whole menu. L says your life and the targets showing in a shooting scene. ' ..
-	'V turns target speech on or off. B turns target sounds on or off. Control stops speech. K repeats this help.'
+	'V turns target speech on or off. B turns target sounds on or off. G turns aim assist on or off. ' ..
+	'Control stops speech. K repeats this help.'
 
 local function keyboard()
 	local keys = input.get()
@@ -521,6 +585,9 @@ local function keyboard()
 		elseif pressed('B') then
 			A.beeps = not A.beeps
 			say(audio and (A.beeps and 'Target sounds on.' or 'Target sounds off.') or 'Target sounds are unavailable.')
+		elseif pressed('G') then
+			A.aim = not A.aim
+			say(A.aim and 'Aim assist on.' or 'Aim assist off.')
 		elseif pressed('K') then say(HELP) end
 	end
 	oldKeys = keys
@@ -547,7 +614,7 @@ function A.shutdown()
 end
 
 local function reset_state()
-	prev = {}; menuKey = nil; shot = {active = false, cells = {}, life = nil}
+	prev = {}; menuKey = nil; shot = {active = false, cells = {}, born = {}, life = nil}
 end
 A.hooks[#A.hooks + 1] = event.onloadstate(reset_state, 'Snatcher access state reset')
 A.hooks[#A.hooks + 1] = event.onexit(function() A.shutdown() end, 'Snatcher access cleanup')
