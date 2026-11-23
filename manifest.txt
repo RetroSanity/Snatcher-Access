@@ -1,0 +1,23 @@
+version 0.21
+file 28851 snatcher-access.lua
+file 4659 README.txt
+file 38852 sounds/civilian0.wav
+file 38852 sounds/civilian1.wav
+file 38852 sounds/civilian2.wav
+file 38852 sounds/civilian3.wav
+file 38852 sounds/civilian4.wav
+file 38852 sounds/civilian5.wav
+file 38852 sounds/civilian6.wav
+file 38852 sounds/civilian7.wav
+file 38852 sounds/civilian8.wav
+file 30032 sounds/enemy0.wav
+file 30032 sounds/enemy1.wav
+file 30032 sounds/enemy2.wav
+file 30032 sounds/enemy3.wav
+file 30032 sounds/enemy4.wav
+file 30032 sounds/enemy5.wav
+file 30032 sounds/enemy6.wav
+file 30032 sounds/enemy7.wav
+file 30032 sounds/enemy8.wav
+file 44144 sounds/hit.wav
+file 21212 sounds/kill.wav

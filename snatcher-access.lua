@@ -78,6 +78,82 @@ if not (speech and speech.say) and not sapi then
 	console.log('Speech output is unavailable: no BizHawk speech module and no Windows voice.')
 end
 
+-- Automatic updates ---------------------------------------------------------------------
+-- When the script starts it asks GitHub for the newest published release of Snatcher Access.
+-- If that release is newer than this script, it downloads the files listed in that release's
+-- manifest.txt, checks each file's size, replaces the old files and restarts itself.
+-- Only published releases are installed, never work in progress. To turn updates off, put a
+-- file called no-update.txt next to this script. Nothing is changed if anything goes wrong.
+local REPO = 'RetroSanity/Snatcher-Access'
+local function update_log(s)
+	console.log('Update: ' .. s)
+	if log then log:write(os.date('%H:%M:%S '), 'Update: ', s, '\n'); log:flush() end
+end
+local function http_get(url, binary)
+	luanet.load_assembly('System')
+	local ServicePointManager = luanet.import_type('System.Net.ServicePointManager')
+	pcall(function() ServicePointManager.SecurityProtocol = luanet.enum(luanet.import_type('System.Net.SecurityProtocolType'), 3072) end)
+	local WebClient = luanet.import_type('System.Net.WebClient')
+	local wc = WebClient()
+	wc.Headers:Add('User-Agent', 'Snatcher-Access-updater')
+	local ok, data = pcall(function() if binary then return wc:DownloadData(url) else return wc:DownloadString(url) end end)
+	pcall(function() wc:Dispose() end)
+	if not ok then error(tostring(data)) end
+	return data
+end
+local function newer(a, b) return (tonumber(a) or 0) > (tonumber(b) or 0) end
+local function check_updates()
+	if not luanet then return false end
+	local f = io.open(folder .. 'no-update.txt', 'r')
+	if f then f:close(); update_log('turned off by no-update.txt'); return false end
+	local json = http_get('https://api.github.com/repos/' .. REPO .. '/releases/latest')
+	local tag = json:match('"tag_name"%s*:%s*"([^"]+)"')
+	if not tag then update_log('no release found'); return false end
+	local latest = tag:gsub('^[vV]', '')
+	if not newer(latest, A.version) then return false end
+	say('Downloading Snatcher Access ' .. latest .. '.')
+	local base = 'https://raw.githubusercontent.com/' .. REPO .. '/' .. tag .. '/'
+	local manifest = http_get(base .. 'manifest.txt')
+	local files = {}
+	for size, path in manifest:gmatch('file%s+(%d+)%s+([^\r\n]+)') do
+		if not path:find('%.%.') and not path:find('^[/\\]') then files[#files + 1] = {path = path, size = tonumber(size)} end
+	end
+	if #files == 0 then update_log('empty manifest'); say('The update could not be downloaded.'); return false end
+	local File = luanet.import_type('System.IO.File')
+	local Directory = luanet.import_type('System.IO.Directory')
+	local Path = luanet.import_type('System.IO.Path')
+	-- Download everything first; only replace files once every download is complete and correct.
+	local staged = {}
+	for _, item in ipairs(files) do
+		local data = http_get(base .. item.path, true)
+		if data.Length ~= item.size then
+			update_log(item.path .. ' has the wrong size (' .. tostring(data.Length) .. ' instead of ' .. item.size .. ')')
+			say('The update could not be downloaded. Your current version is unchanged.')
+			return false
+		end
+		local dest = folder .. item.path:gsub('/', '\\')
+		staged[#staged + 1] = {dest = dest, data = data}
+	end
+	for _, s in ipairs(staged) do
+		Directory.CreateDirectory(Path.GetDirectoryName(s.dest))
+		File.WriteAllBytes(s.dest .. '.new', s.data)
+	end
+	for _, s in ipairs(staged) do File.Copy(s.dest .. '.new', s.dest, true); File.Delete(s.dest .. '.new') end
+	update_log('updated from ' .. A.version .. ' to ' .. latest)
+	say('Updated to Snatcher Access ' .. latest .. '. Restarting.')
+	return true
+end
+if not SNATCHER_UPDATED then
+	local ok, result = pcall(check_updates)
+	if not ok then update_log('check failed: ' .. tostring(result))
+	elseif result then
+		SNATCHER_UPDATED = true
+		if log then log:close(); log = nil end
+		if sapi then pcall(function() sapi:Dispose() end); sapi = nil end
+		return dofile(source)
+	end
+end
+
 -- Sounds --------------------------------------------------------------------------------
 A.beeps = true      -- positional target sounds
 A.voice = true      -- spoken target positions

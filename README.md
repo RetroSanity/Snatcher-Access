@@ -70,6 +70,10 @@ The Junker HQ shooting range uses the same nine spots, so practise there.
 
 Choose Use Metal Gear, Videophone, Call. The arrows move between keys and each key is spoken. C types a key and reads back the number so far. B deletes a digit. The call goes through as soon as you type a number the game knows.
 
+## Automatic updates
+
+Each time the script starts, it checks this repository for a newer published release. If there is one, it says "Downloading Snatcher Access" and the version, downloads the new files listed in that release's `manifest.txt`, checks their sizes, replaces the old files and restarts itself. Only published releases are installed. If you are offline or anything goes wrong, nothing is changed. To turn updates off, put an empty file called `no-update.txt` next to `snatcher-access.lua`.
+
 ## Keyboard keys
 
 | Key | What it does |
