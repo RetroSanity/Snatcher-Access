@@ -1,4 +1,4 @@
-SNATCHER ACCESS, version 0.21
+SNATCHER ACCESS, version 0.22
 A screen reader mod for Snatcher (USA, Sega CD), played in the BizHawk emulator.
 It reads the game aloud so blind players can play it from start to finish.
 
@@ -14,7 +14,7 @@ WHAT YOU NEED
 
 INSTALLING
 1. Unzip this folder anywhere, for example inside your BizHawk folder.
-   Keep snatcher-access.lua and the sounds folder together.
+   Keep snatcher-access.lua, prism.dll and the sounds folder together.
 2. Open BizHawk and load your Snatcher (USA) disc image.
 3. Open the Tools menu, then Lua Console.
 4. In the Lua Console, open the Script menu, choose Open Script, and pick
@@ -22,8 +22,10 @@ INSTALLING
 5. You hear Snatcher Access say that it is ready, with its version number. Go back to the game window.
 
 SPEECH
-If your BizHawk has built-in speech support (speech.say), the mod talks
-through your screen reader. Otherwise it tries to use the Windows voice.
+The mod speaks through Prism (prism.dll, included), which works with NVDA,
+JAWS, Narrator and other screen readers, or a Windows voice if no screen
+reader is running. If Prism cannot start, it uses BizHawk's own speech if
+your BizHawk has it, and otherwise the Windows voice.
 Everything said is also written to snatcher-speech.log next to the script.
 
 STARTING THE GAME
@@ -56,7 +58,10 @@ Enemies appear in one of nine spots: up left, up, up right, left, center,
 right, down left, down, down right. Each one is spoken ("Enemy up left",
 "Civilian right, don't shoot") and plays a sound: left and right in your
 headphones match the screen, high pitch is the top row, low is the bottom.
-Enemies beep twice, civilians make one soft falling tone.
+Enemies beep from where they are, over and over, slowly at first and faster
+the longer they stay. Only the enemy that has been there longest beeps (where
+aim assist points); a newer one gives a single beep. Civilians make one soft
+falling tone.
 AIM ASSIST is on by default (G turns it off and on). It draws your blaster
 at the start of each shooting scene and points your aim at the oldest enemy,
 so you only press C when you hear "Enemy". Your own D pad always overrides
@@ -93,3 +98,8 @@ K: help.
 KNOWN LIMITS
 Picture captions later in the game, after the opening, are not read yet.
 The act number on the investigation files is not read.
+
+PRISM
+Speech uses Prism (github.com/ethindp/prism), licensed under the Mozilla Public
+License 2.0. Its licence and the licences of the parts it uses are in the
+prism-licences folder.

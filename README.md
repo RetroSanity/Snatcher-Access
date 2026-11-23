@@ -16,7 +16,7 @@ Get the latest zip from the [Releases page](../../releases/latest).
 
 ## Installing
 
-1. Unzip the release anywhere, for example inside your BizHawk folder. Keep `snatcher-access.lua` and the `sounds` folder together.
+1. Unzip the release anywhere, for example inside your BizHawk folder. Keep `snatcher-access.lua`, `prism.dll` and the `sounds` folder together.
 2. Open BizHawk and load your Snatcher (USA) disc image.
 3. Open the Tools menu, then Lua Console.
 4. In the Lua Console, open the Script menu, choose Open Script, and pick `snatcher-access.lua`.
@@ -24,7 +24,7 @@ Get the latest zip from the [Releases page](../../releases/latest).
 
 ## Speech
 
-If your BizHawk has built-in speech support (`speech.say`), the mod talks through your screen reader. Otherwise it tries to use the Windows voice. Everything said is also written to `snatcher-speech.log` next to the script.
+The mod speaks through [Prism](https://github.com/ethindp/prism) (`prism.dll`, included), which works with NVDA, JAWS, Narrator and other screen readers, or a Windows voice if no screen reader is running. If Prism cannot start, the mod uses BizHawk's own speech if your BizHawk has it (`speech.say`), and otherwise the Windows voice. Everything said is also written to `snatcher-speech.log` next to the script.
 
 ## Starting the game
 
@@ -56,7 +56,9 @@ Voiced scenes have no text in this version of the game, so the mod stays quiet w
 
 ## Shooting scenes
 
-Enemies appear in one of nine spots: up left, up, up right, left, center, right, down left, down, down right. Each one is spoken ("Enemy up left", "Civilian right, don't shoot") and plays a sound. Left and right in your headphones match the screen. A high pitch is the top row and a low pitch is the bottom. Enemies beep twice; civilians make one soft falling tone.
+Enemies appear in one of nine spots: up left, up, up right, left, center, right, down left, down, down right. Each one is spoken ("Enemy up left", "Civilian right, don't shoot") and plays a sound. Left and right in your headphones match the screen. A high pitch is the top row and a low pitch is the bottom.
+
+Enemies beep from where they are, over and over: slowly at first, then faster the longer the enemy stays, because enemies attack if left too long. Only one enemy beeps at a time, the one that has been there longest (where aim assist points); a newer enemy gives a single beep from its spot. Civilians make one soft falling tone.
 
 **Aim assist** is on by default (G turns it off and on). At the start of each shooting scene it draws your blaster for you ("Blaster ready"), and it points your aim at the oldest enemy on screen, so you only need to press C when you hear "Enemy". Holding the D pad yourself always overrides it, and it never aims at civilians.
 
@@ -94,3 +96,7 @@ Each time the script starts, it checks this repository for a newer published rel
 - The act number on the investigation files is not read.
 
 If a screen is silent, please open an issue saying what it was and what you did to get there.
+
+## Credits
+
+Speech uses [Prism](https://github.com/ethindp/prism), licensed under the Mozilla Public License 2.0. Its licence and the licences of the parts it uses are in the `prism-licences` folder.

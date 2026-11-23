@@ -1,4 +1,4 @@
--- Snatcher Access, version 0.21
+-- Snatcher Access, version 0.22
 -- Screen reader support for Snatcher (USA, Sega CD) in BizHawk (Genesis Plus GX core).
 -- Reads dialogue with speaker names, every command menu, the title/options/backup RAM
 -- screens, and announces targets during shooting scenes with speech and positional sounds.
@@ -22,7 +22,7 @@
 --                    3-5 leaving, 7 destroyed)
 --   0x7897/0x7899    system screen (0/2 backup RAM choice, 9/2 title, 0B options)
 
-local A = {version = '0.21', frame = 0, hooks = {}}
+local A = {version = '0.22', frame = 0, hooks = {}}
 local source = debug.getinfo(1, 'S').source:sub(2)
 local folder = source:match('^(.*[/\\])') or './'
 local D = 'CD PRG RAM'
@@ -30,10 +30,99 @@ local D = 'CD PRG RAM'
 local log = io.open(folder .. 'snatcher-speech.log', 'a')
 local last_said, last_message = '', ''
 
--- Speech: BizHawk builds with a speech module (speech.say) talk through the screen reader.
--- Ordinary BizHawk has no speech module, so fall back to the Windows voice (SAPI).
+-- Speech ----------------------------------------------------------------------------------
+-- 1. Prism (prism.dll), which talks to whichever screen reader is running (NVDA, JAWS,
+--    Narrator, and others) or a Windows voice. Lua cannot load a DLL itself, so a tiny C#
+--    bridge is compiled in memory by the .NET Framework that BizHawk runs on.
+-- 2. BizHawk builds with their own speech module (speech.say).
+-- 3. The Windows voice (SAPI) as a last resort.
+local prism = nil
+local function find_prism()
+	local dirs = {folder, folder .. '..\\Snatcher Access\\'}
+	pcall(function()
+		luanet.load_assembly('mscorlib')
+		local AppDomain = luanet.import_type('System.AppDomain')
+		dirs[#dirs + 1] = AppDomain.CurrentDomain.BaseDirectory
+	end)
+	for _, d in ipairs(dirs) do
+		local f = io.open(d .. 'prism.dll', 'rb')
+		if f then f:close(); return d .. 'prism.dll' end
+	end
+	return nil
+end
+local function start_prism()
+	if not luanet or SNATCHER_NO_PRISM then return nil end
+	local dll = find_prism()
+	if not dll then return nil end
+	dll = dll:gsub('/', '\\')
+	luanet.load_assembly('System')
+	local code = [[
+using System; using System.Runtime.InteropServices; using System.Text;
+public static class SnatcherPrism {
+	const string D = @"DLLPATH";
+	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern IntPtr prism_init(IntPtr cfg);
+	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern IntPtr prism_registry_create_best(IntPtr ctx);
+	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern int prism_backend_speak(IntPtr b, byte[] text, [MarshalAs(UnmanagedType.I1)] bool interrupt);
+	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern int prism_backend_stop(IntPtr b);
+	[DllImport(D, CallingConvention = CallingConvention.Cdecl)] static extern IntPtr prism_backend_name(IntPtr b);
+	static IntPtr ctx, backend;
+	public static string Start() {
+		ctx = prism_init(IntPtr.Zero);
+		if (ctx == IntPtr.Zero) return null;
+		backend = prism_registry_create_best(ctx);
+		if (backend == IntPtr.Zero) return null;
+		IntPtr n = prism_backend_name(backend);
+		return n == IntPtr.Zero ? "speech" : Marshal.PtrToStringAnsi(n);
+	}
+	public static int Speak(string text, bool interrupt) {
+		if (backend == IntPtr.Zero) return -1;
+		return prism_backend_speak(backend, Encoding.UTF8.GetBytes(text + "\0"), interrupt);
+	}
+	public static int Stop() { return backend == IntPtr.Zero ? -1 : prism_backend_stop(backend); }
+}]]
+	code = code:gsub('DLLPATH', function() return dll end)
+	local Provider = luanet.import_type('Microsoft.CSharp.CSharpCodeProvider')
+	local Params = luanet.import_type('System.CodeDom.Compiler.CompilerParameters')
+	local Array = luanet.import_type('System.Array')
+	local TypeT = luanet.import_type('System.Type')
+	local StringT = TypeT.GetType('System.String')
+	local ObjectT = TypeT.GetType('System.Object')
+	local params = Params()
+	params.GenerateInMemory = true
+	params.GenerateExecutable = false
+	params.ReferencedAssemblies:Add('System.dll')
+	local sources = Array.CreateInstance(StringT, 1)
+	sources:SetValue(code, 0)
+	local result = Provider():CompileAssemblyFromSource(params, sources)
+	if result.Errors.HasErrors then
+		console.log('Prism bridge did not compile: ' .. tostring(result.Errors:get_Item(0)))
+		return nil
+	end
+	local t = result.CompiledAssembly:GetType('SnatcherPrism')
+	local mSpeak, mStop = t:GetMethod('Speak'), t:GetMethod('Stop')
+	local name = t:GetMethod('Start'):Invoke(nil, nil)
+	if name == nil then return nil end
+	local args = Array.CreateInstance(ObjectT, 2)
+	return {
+		name = tostring(name),
+		say = function(text, interrupt)
+			args:SetValue(text, 0); args:SetValue(interrupt and true or false, 1)
+			local r = mSpeak:Invoke(nil, args)
+			return tonumber(tostring(r)) == 0
+		end,
+		stop = function() mStop:Invoke(nil, nil) end,
+	}
+end
+if SNATCHER_PRISM then
+	prism = SNATCHER_PRISM   -- already started before an automatic update restarted the script
+else
+	local ok, p = pcall(start_prism)
+	if ok and p then prism = p; SNATCHER_PRISM = p; console.log('Speech through Prism (' .. p.name .. ').')
+	elseif not ok then console.log('Prism unavailable: ' .. tostring(p)) end
+end
+
 local sapi = nil
-if not (speech and speech.say) and luanet then
+if not prism and not (speech and speech.say) and luanet then
 	pcall(function()
 		luanet.load_assembly('System.Speech')
 		local Synth = luanet.import_type('System.Speech.Synthesis.SpeechSynthesizer')
@@ -46,6 +135,10 @@ local function say(s, interrupt)
 	last_said = s
 	console.log(s)
 	if log then log:write(os.date('%H:%M:%S '), s, '\n'); log:flush() end
+	if prism then
+		local ok, spoke = pcall(prism.say, s, interrupt ~= false)
+		if ok and spoke then return end
+	end
 	if speech and speech.say then
 		if interrupt == false then speech.say(s, false) else speech.say(s) end
 	elseif sapi then
@@ -56,6 +149,7 @@ local function say(s, interrupt)
 	end
 end
 local function stop_speech()
+	if prism then pcall(prism.stop) end
 	if speech and speech.stop then speech.stop()
 	elseif sapi then pcall(function() sapi:SpeakAsyncCancelAll() end) end
 end
@@ -74,8 +168,8 @@ if not okDomain then
 	say('Snatcher access could not find the Sega CD program memory. Load Snatcher, USA, Sega CD, with the Genesis Plus GX core.')
 	return
 end
-if not (speech and speech.say) and not sapi then
-	console.log('Speech output is unavailable: no BizHawk speech module and no Windows voice.')
+if not prism and not (speech and speech.say) and not sapi then
+	console.log('Speech output is unavailable: no Prism, no BizHawk speech module and no Windows voice.')
 end
 
 -- Automatic updates ---------------------------------------------------------------------
@@ -244,6 +338,10 @@ local function title_case(s)
 	s = s:lower():gsub("(%a)([%w']*)", function(f, r) return f:upper() .. r end)
 	s = s:gsub("I%.d%.", "I.D."):gsub(" Of ", " of "):gsub(" The ", " the "):gsub(" To ", " to ")
 	s = s:gsub("'S ", "'s "):gsub("'S$", "'s")
+	for _, ac in ipairs({'HQ', 'TV', 'CD', 'DNA', 'OK'}) do
+		local low = ac:sub(1, 1) .. ac:sub(2):lower()
+		s = s:gsub('%f[%a]' .. low .. '%f[%A]', ac)
+	end
 	return s
 end
 
@@ -541,13 +639,53 @@ local function aim_assist(phase)
 	end
 end
 
+-- The enemy beacon: one enemy at a time (the one that has been there longest, which is also
+-- where aim assist points) beeps from its position over and over. It starts slow and speeds
+-- up the longer that enemy stays, because enemies attack if they are left too long.
+local function beacon_interval(age)
+	return math.max(7, math.floor(48 - age * 0.34))   -- frames: about 0.8 s down to about 0.12 s
+end
+local function oldest_enemy()
+	local best, born = nil, nil
+	for c = 0, 8 do
+		local st = shot.cells[c] or 0
+		local kind, ph = math.floor(st / 16), st % 16
+		if kind == 1 and ph >= 1 and ph <= 4 and (not born or shot.born[c] < born) then best, born = c, shot.born[c] end
+	end
+	return best
+end
+local function beacon()
+	local c = oldest_enemy()
+	if c ~= shot.beaconCell then
+		shot.beaconCell = c
+		shot.beaconNext = A.frame          -- a new target beeps straight away
+	end
+	if not c or not A.beeps or not audio then return end
+	if A.frame >= (shot.beaconNext or 0) and A.frame >= (shot.quietUntil or 0) then
+		audio.play('enemy', c)
+		shot.beaconNext = A.frame + beacon_interval(A.frame - (shot.born[c] or A.frame))
+	end
+end
+
+local function check_life()
+	local life = u8(0x892D)
+	if shot.life and life < shot.life and life < 32 then
+		if audio then audio.hit() end
+		shot.quietUntil = A.frame + 15
+		say(life == 0 and 'Hit! Life 0. You are down.' or ('Hit! Life ' .. life .. '.'), false)
+	end
+	shot.life = life
+end
+
 local function shooting()
 	local phase = u8(0x78E9)
 	local on = phase == 1 or phase == 2
 	if on ~= shot.active then
+		if not on and shot.active then check_life() end   -- the last hit can land as the scene ends
 		shot.active = on
 		shot.cells, shot.born = {}, {}
 		shot.drawTries, shot.drawAt, shot.drawn = nil, nil, nil
+		shot.beaconCell, shot.beaconNext, shot.quietUntil = nil, nil, nil
 		if on then
 			shot.life = u8(0x892D)
 			say('Shooting! Life ' .. shot.life .. '.' .. (A.aim and ' Aim assist on.' or ''), false)
@@ -579,31 +717,31 @@ local function shooting()
 			if ph <= 2 and (old == 0 or oldkind ~= kind or (old % 16) >= 3) and (kind == 1 or kind == 2) then
 				shot.born[c] = A.frame
 				local what = (kind == 1) and ('Enemy ' .. CELLS[c]) or ('Civilian ' .. CELLS[c] .. ", don't shoot")
-				if A.beeps and audio then audio.play(kind == 1 and 'enemy' or 'civilian', c) end
+				if kind == 2 and A.beeps and audio then
+					audio.play('civilian', c)
+					shot.quietUntil = A.frame + 12
+				elseif kind == 1 and A.beeps and audio and shot.beaconCell and shot.beaconCell ~= c then
+					-- the beacon is busy with an older enemy: one beep so you still hear where this one is
+					audio.play('enemy', c)
+				end
 				if A.voice then
 					-- Enemies cut in at once; civilians wait their turn so they never cut off an enemy.
 					say(what, kind == 1 and spoken == 0)
 					spoken = spoken + 1
 				end
 			-- Shot: an enemy passes through 6 to 7, a civilian jumps straight to 7.
-			elseif ph == 7 and (old % 16) ~= 7 and (old % 16) ~= 6 then
+			elseif (ph == 7 and (old % 16) ~= 7 and (old % 16) ~= 6) or (ph == 6 and kind == 1) then
 				if kind == 1 then
-					if A.beeps and audio then audio.kill() end
+					if A.beeps and audio then audio.kill(); shot.quietUntil = A.frame + 10 end
 				elseif kind == 2 then
 					say('You shot a civilian!')
 				end
-			elseif ph == 6 and kind == 1 then
-				if A.beeps and audio then audio.kill() end
 			end
 			shot.cells[c] = st
 		end
 	end
-	local life = u8(0x892D)
-	if shot.life and life < shot.life and life < 32 then
-		if audio then audio.hit() end
-		say(life == 0 and 'Hit! Life 0. You are down.' or ('Hit! Life ' .. life .. '.'), false)
-	end
-	shot.life = life
+	check_life()
+	beacon()
 	aim_assist(phase)
 end
 
