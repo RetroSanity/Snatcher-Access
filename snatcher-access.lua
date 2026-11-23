@@ -1,4 +1,4 @@
--- Snatcher Access, version 0.25
+-- Snatcher Access, version 0.26
 -- Screen reader support for Snatcher (USA, Sega CD) in BizHawk (Genesis Plus GX core).
 -- Reads dialogue with speaker names, every command menu, the title/options/backup RAM
 -- screens, and announces targets during shooting scenes with speech and positional sounds.
@@ -22,7 +22,7 @@
 --                    3-5 leaving, 7 destroyed)
 --   0x7897/0x7899    system screen (0/2 backup RAM choice, 9/2 title, 0B options)
 
-local A = {version = '0.25', frame = 0, hooks = {}}
+local A = {version = '0.26', frame = 0, hooks = {}}
 local source = debug.getinfo(1, 'S').source:sub(2)
 local folder = source:match('^(.*[/\\])')
 if not folder then
@@ -139,8 +139,11 @@ public class SnatcherPrism {
 			return r;
 		} catch (Exception e) { LastError = Describe(e); return -2; }
 	}
-	public int SpeakNow(string text) { return Speak(text, true); }
-	public int SpeakQueued(string text) { return Speak(text, false); }
+	// BizHawk's Lua bridge can fail to pass a string to a method it has called before, so the
+	// script puts the text in this field and then calls a method with no arguments.
+	public string Pending = "";
+	public int SpeakNow() { return Speak(Pending, true); }
+	public int SpeakQueued() { return Speak(Pending, false); }
 	[HandleProcessCorruptedStateExceptions, SecurityCritical]
 	public int Stop() {
 		try { return backend == IntPtr.Zero ? -1 : prism_backend_stop(backend); }
@@ -178,7 +181,8 @@ public class SnatcherPrism {
 		name = name,
 		say = function(text, interrupt)
 			local ok, r = pcall(function()
-				if interrupt then return bridge:SpeakNow(text) else return bridge:SpeakQueued(text) end
+				bridge.Pending = text
+				if interrupt then return bridge:SpeakNow() else return bridge:SpeakQueued() end
 			end)
 			if not ok then return false, explain(r) end
 			if tonumber(tostring(r)) ~= 0 then return false, tostring(bridge.LastError) end

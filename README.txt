@@ -1,4 +1,4 @@
-SNATCHER ACCESS, version 0.25
+SNATCHER ACCESS, version 0.26
 A screen reader mod for Snatcher (USA, Sega CD), played in the BizHawk emulator.
 It reads the game aloud so blind players can play it from start to finish.
 
